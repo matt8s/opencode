@@ -762,12 +762,6 @@ export function run(
                 set: { value: { phase: "completed" }, time_updated: Date.now() },
               })
               .run()
-            // This import already attributed global sessions to their folders' projects.
-            yield* tx
-              .insert(KVTable)
-              .values({ key: REPAIR_STATE_KEY, value: { phase: "completed" } })
-              .onConflictDoNothing()
-              .run()
           }),
         )
         .pipe(Effect.orDie)

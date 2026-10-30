@@ -1364,7 +1364,16 @@ describe("V1Migration database workflow", () => {
     )
   })
 
-  test.each([1, 2])("retries unfinished V1 global repairs after lookup timeout %i", async (timeoutAt) => {
+  test.each([
+    { phase: "completed", timeoutAt: 1, lookups: 1, owned: 0 },
+    { phase: "completed", timeoutAt: 2, lookups: 2, owned: 2 },
+    { phase: "fresh", timeoutAt: 0, lookups: 3, owned: 6 },
+    { phase: "fresh", timeoutAt: 1, lookups: 1, owned: 0 },
+    { phase: "fresh", timeoutAt: 2, lookups: 2, owned: 2 },
+    { phase: "resumed", timeoutAt: 0, lookups: 2, owned: 4 },
+    { phase: "resumed", timeoutAt: 1, lookups: 1, owned: 0 },
+    { phase: "resumed", timeoutAt: 2, lookups: 2, owned: 2 },
+  ])("retries unfinished V1 global repairs after $phase import (timeout $timeoutAt)", async (input) => {
     await using tmp = await tmpdir()
     const directories = ["a", "b", "c"].map((name) => path.join(tmp.path, name))
     await Promise.all(directories.map((directory) => fs.mkdir(directory)))
@@ -1377,11 +1386,12 @@ describe("V1Migration database workflow", () => {
           INSERT INTO project (id, worktree, time_created, time_updated, sandboxes)
           VALUES ('global', '/', 1, 2, '[]')
         `)
-        yield* db.run(sql`
-          INSERT INTO kv (key, value, time_created, time_updated)
-          VALUES ('migration.v1-v2', '{"phase":"completed"}', 1, 1)
-        `)
-        yield* Effect.forEach(directories, (directory, index) =>
+        if (input.phase !== "fresh")
+          yield* db.run(sql`
+            INSERT INTO kv (key, value, time_created, time_updated)
+            VALUES ('migration.v1-v2', ${input.phase === "completed" ? '{"phase":"completed"}' : '{"phase":"sessions","cursor":"ses_2_child"}'}, 1, 1)
+          `)
+        const messages = (yield* Effect.forEach(directories, (directory, index) =>
           Effect.forEach(["root", "child"], (kind) =>
             Effect.gen(function* () {
               const id = `ses_${index}_${kind}`
@@ -1390,26 +1400,46 @@ describe("V1Migration database workflow", () => {
                 INSERT INTO session (id, project_id, parent_id, slug, directory, title, version, time_created, time_updated)
                 VALUES (${id}, 'global', ${parent}, ${id}, ${directory}, 'Test', '1', 10, 20)
               `)
-              yield* db.run(sql`
-                INSERT INTO session_v2 (id, project_id, parent_id, slug, directory, title, version, time_created, time_updated)
-                VALUES (${id}, 'global', ${parent}, ${id}, ${directory}, 'Test', '1', 10, 20)
-              `)
+              const source = user(`msg_${id}`, {}, 11)
+              const sourcePart = part(`prt_${id}`, source.id, { type: "text", text: "keep projected history" })
               yield* db.run(sql`
                 INSERT INTO message (id, session_id, time_created, time_updated, data)
-                VALUES (${`msg_${id}`}, ${id}, 11, 12, '{"role":"user","text":"keep legacy history"}')
+                VALUES (${source.id}, ${id}, 11, 12, ${source.data})
               `)
               yield* db.run(sql`
-                INSERT INTO session_message (id, session_id, type, seq, time_created, time_updated, data)
-                VALUES (${`msg_${id}`}, ${id}, 'user', 0, 11, 12, '{"text":"keep projected history"}')
+                INSERT INTO part (id, message_id, session_id, time_created, time_updated, data)
+                VALUES (${sourcePart.id}, ${source.id}, ${id}, 1, 2, ${sourcePart.data})
               `)
+              const projected = {
+                id: source.id,
+                session_id: id,
+                type: "user",
+                seq: 0,
+                time_created: 11,
+                time_updated: 12,
+                data: '{"text":"keep projected history","time":{"created":11}}',
+              }
+              if (input.phase === "completed" || (input.phase === "resumed" && index === 2)) {
+                yield* db.run(sql`
+                  INSERT INTO session_v2 (id, project_id, parent_id, slug, directory, title, version, time_created, time_updated)
+                  VALUES (${id}, 'global', ${parent}, ${id}, ${directory}, 'Test', '1', 10, 20)
+                `)
+                yield* db.run(sql`
+                  INSERT INTO session_message (id, session_id, type, seq, time_created, time_updated, data)
+                  VALUES (${projected.id}, ${id}, 'user', 0, 11, 12, ${projected.data})
+                `)
+              }
+              return projected
             }),
           ),
-        )
+        ))
+          .flat()
+          .toSorted((a, b) => a.id.localeCompare(b.id))
         const legacy = yield* db.all(sql`SELECT * FROM session ORDER BY id`)
         const legacyMessages = yield* db.all(sql`SELECT * FROM message ORDER BY id`)
-        const messages = yield* db.all(sql`SELECT * FROM session_message ORDER BY id`)
+        const legacyParts = yield* db.all(sql`SELECT * FROM part ORDER BY id`)
         const metadata = yield* db.all(sql`
-          SELECT id, parent_id, directory, time_created, time_updated FROM session_v2 ORDER BY id
+          SELECT id, parent_id, directory, time_created, time_updated FROM session ORDER BY id
         `)
         const stalled = yield* Deferred.make<void>()
         const attempted: string[] = []
@@ -1419,7 +1449,7 @@ describe("V1Migration database workflow", () => {
             resolve: (directory, options) =>
               Effect.gen(function* () {
                 attempted.push(directory)
-                if (attempted.length === timeoutAt) {
+                if (attempted.length === input.timeoutAt) {
                   yield* Deferred.succeed(stalled, undefined)
                   return yield* Effect.never
                 }
@@ -1428,36 +1458,44 @@ describe("V1Migration database workflow", () => {
           }),
           Effect.forkChild({ startImmediately: true }),
         )
-        yield* Deferred.await(stalled)
-        yield* Effect.yieldNow
-        yield* TestClock.adjust("6 seconds")
+        if (input.timeoutAt !== 0) {
+          yield* Deferred.await(stalled)
+          yield* Effect.yieldNow
+          yield* TestClock.adjust("6 seconds")
+        }
         expect(yield* Fiber.join(fiber)).toEqual({ status: "completed" })
+        expect(yield* db.get(sql`SELECT value FROM kv WHERE key = 'migration.v1-v2'`)).toEqual({
+          value: '{"phase":"completed"}',
+        })
         expect(yield* db.get(sql`SELECT value FROM kv WHERE key = 'migration.v1-v2.global-sessions'`)).toBeUndefined()
-        const committed = yield* db.all<{ id: string; project_id: string; path: string }>(sql`
-          SELECT id, project_id, path FROM session_v2 WHERE project_id != 'global' ORDER BY id
+        const committed = yield* db.all<{ id: string; project_id: string; path: string; directory: string }>(sql`
+          SELECT id, project_id, path, directory FROM session_v2 WHERE project_id != 'global' ORDER BY id
         `)
-        expect(committed).toHaveLength((timeoutAt - 1) * 2)
+        expect(attempted).toHaveLength(input.lookups)
+        expect(committed).toHaveLength(input.owned)
         expect(yield* db.all(sql`SELECT * FROM session ORDER BY id`)).toEqual(legacy)
         expect(yield* db.all(sql`SELECT * FROM message ORDER BY id`)).toEqual(legacyMessages)
+        expect(yield* db.all(sql`SELECT * FROM part ORDER BY id`)).toEqual(legacyParts)
         expect(yield* db.all(sql`SELECT * FROM session_message ORDER BY id`)).toEqual(messages)
 
         const retried: string[] = []
-        expect(
-          yield* V1Migration.run().pipe(
-            Effect.provideService(Project.Service, {
-              ...projects,
-              resolve: (directory, options) => {
-                retried.push(directory)
-                return projects.resolve(directory, options)
-              },
-            }),
-          ),
-        ).toEqual({ status: "completed" })
+        const healthy = Project.Service.of({
+          ...projects,
+          resolve: (directory, options) => {
+            retried.push(directory)
+            return projects.resolve(directory, options)
+          },
+        })
+        expect(yield* V1Migration.run().pipe(Effect.provideService(Project.Service, healthy))).toEqual({
+          status: "completed",
+        })
         expect(retried.toSorted()).toEqual(
-          directories.filter((directory) => !attempted.slice(0, -1).includes(directory)),
+          directories.filter((directory) => !committed.some((row) => row.directory === directory)),
         )
         expect(
-          yield* db.all(sql`SELECT id, project_id, path FROM session_v2 WHERE project_id != 'global' ORDER BY id`),
+          yield* db.all(
+            sql`SELECT id, project_id, path, directory FROM session_v2 WHERE project_id != 'global' ORDER BY id`,
+          ),
         ).toEqual(expect.arrayContaining(committed))
         yield* Effect.forEach(directories, (directory, index) =>
           Effect.gen(function* () {
@@ -1479,10 +1517,19 @@ describe("V1Migration database workflow", () => {
         ).toEqual(metadata)
         expect(yield* db.all(sql`SELECT * FROM session ORDER BY id`)).toEqual(legacy)
         expect(yield* db.all(sql`SELECT * FROM message ORDER BY id`)).toEqual(legacyMessages)
+        expect(yield* db.all(sql`SELECT * FROM part ORDER BY id`)).toEqual(legacyParts)
         expect(yield* db.all(sql`SELECT * FROM session_message ORDER BY id`)).toEqual(messages)
         expect(yield* db.get(sql`SELECT value FROM kv WHERE key = 'migration.v1-v2.global-sessions'`)).toEqual({
           value: '{"phase":"completed"}',
         })
+        const repaired = yield* db.all(sql`SELECT * FROM session_v2 ORDER BY id`)
+        retried.length = 0
+        expect(yield* V1Migration.run().pipe(Effect.provideService(Project.Service, healthy))).toEqual({
+          status: "completed",
+        })
+        expect(retried).toEqual([])
+        expect(yield* db.all(sql`SELECT * FROM session_v2 ORDER BY id`)).toEqual(repaired)
+        expect(yield* db.all(sql`SELECT * FROM session_message ORDER BY id`)).toEqual(messages)
       }).pipe(Effect.provide(TestClock.layer())),
     )
   })
