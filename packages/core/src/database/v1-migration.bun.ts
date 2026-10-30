@@ -797,7 +797,7 @@ function repairGlobalSessions(db: Database.Interface["db"]) {
         yield* Effect.logWarning("Stopped repairing V1 global sessions after a timeout", {
           directory: folder.directory,
         })
-        break
+        return
       }
       const owner = resolved.value
       if (!owner || owner.project.id === Project.ID.global) continue

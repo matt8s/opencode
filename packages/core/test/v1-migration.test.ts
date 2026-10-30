@@ -15,7 +15,8 @@ import { AppNodeBuilder } from "@opencode/core/effect/app-node-builder"
 import { LayerNode } from "@opencode/util/effect/layer-node"
 import { FSUtil } from "@opencode/util/fs-util"
 import { Global } from "@opencode/util/global"
-import { Effect, Fiber, Layer, Logger, Schedule, Schema, Scope } from "effect"
+import { Deferred, Effect, Fiber, Layer, Logger, Schedule, Schema, Scope } from "effect"
+import { TestClock } from "effect/testing"
 import { eq, sql } from "drizzle-orm"
 import type { SqlClient } from "effect/sql/SqlClient"
 import { tmpdir } from "./fixture/tmpdir"
@@ -1276,9 +1277,12 @@ describe("V1Migration database workflow", () => {
         )
         const sessions = [
           { id: "ses_plain", directory: plain, v1: true },
+          { id: "ses_child", directory: plain, v1: true },
           { id: "ses_repo", directory: path.join(repo, "pkg", "a"), v1: true },
           { id: "ses_missing", directory: missing, v1: true },
           { id: "ses_native", directory: plain, v1: false },
+          { id: "ses_workspace", directory: plain, v1: true },
+          { id: "ses_owned", directory: plain, v1: true },
         ]
         yield* Effect.forEach(sessions, (input) =>
           Effect.gen(function* () {
@@ -1291,8 +1295,40 @@ describe("V1Migration database workflow", () => {
               INSERT INTO session_v2 (id, project_id, slug, directory, title, version, time_created, time_updated)
               VALUES (${input.id}, 'global', ${input.id}, ${input.directory}, 'Test', '1', 1, 2)
             `)
+            yield* db.run(sql`
+              INSERT INTO session_message (id, session_id, type, seq, time_created, time_updated, data)
+              VALUES (${`msg_${input.id}`}, ${input.id}, 'user', 0, 1, 2, '{"text":"preserve this transcript"}')
+            `)
+            if (input.v1) {
+              yield* db.run(sql`
+                INSERT INTO message (id, session_id, time_created, time_updated, data)
+                VALUES (${`msg_${input.id}`}, ${input.id}, 1, 2, '{"role":"user"}')
+              `)
+              yield* db.run(sql`
+                INSERT INTO part (id, message_id, session_id, time_created, time_updated, data)
+                VALUES (${`prt_${input.id}`}, ${`msg_${input.id}`}, ${input.id}, 1, 2, '{"type":"text","text":"keep"}')
+              `)
+            }
           }),
         )
+        yield* db.run(sql`UPDATE session SET parent_id = 'ses_plain' WHERE id = 'ses_child'`)
+        yield* db.run(sql`UPDATE session_v2 SET parent_id = 'ses_plain' WHERE id = 'ses_child'`)
+        yield* db.run(sql`
+          INSERT INTO project (id, worktree, time_created, time_updated, sandboxes)
+          VALUES ('owned', ${plain}, 1, 2, '[]')
+        `)
+        yield* db.run(sql`UPDATE session_v2 SET project_id = 'owned', path = 'kept' WHERE id = 'ses_owned'`)
+        yield* db.run(sql`
+          INSERT INTO workspace (id, provider, created_at, last_used_at) VALUES ('wrk_explicit', 'local', 1, 2)
+        `)
+        yield* db.run(sql`UPDATE session_v2 SET workspace_id = 'wrk_explicit' WHERE id = 'ses_workspace'`)
+        const legacy = yield* db.all(sql`SELECT * FROM session ORDER BY id`)
+        const legacyMessages = yield* db.all(sql`SELECT * FROM message ORDER BY id`)
+        const legacyParts = yield* db.all(sql`SELECT * FROM part ORDER BY id`)
+        const messages = yield* db.all(sql`SELECT * FROM session_message ORDER BY id`)
+        const metadata = yield* db.all(sql`
+          SELECT id, parent_id, workspace_id, directory, time_created, time_updated FROM session_v2 ORDER BY id
+        `)
 
         expect(yield* V1Migration.run()).toEqual({ status: "completed" })
         const owners = {
@@ -1300,15 +1336,154 @@ describe("V1Migration database workflow", () => {
           repo: yield* projects.resolve(AbsolutePath.make(repo)),
         }
         expect(yield* db.all(sql`SELECT id, project_id, path, time_updated FROM session_v2 ORDER BY id`)).toEqual([
+          { id: "ses_child", project_id: owners.plain.id, path: "", time_updated: 2 },
           { id: "ses_missing", project_id: "global", path: null, time_updated: 2 },
           { id: "ses_native", project_id: "global", path: null, time_updated: 2 },
+          { id: "ses_owned", project_id: "owned", path: "kept", time_updated: 2 },
           { id: "ses_plain", project_id: owners.plain.id, path: "", time_updated: 2 },
           { id: "ses_repo", project_id: owners.repo.id, path: "pkg/a", time_updated: 2 },
+          { id: "ses_workspace", project_id: "global", path: null, time_updated: 2 },
         ])
+        expect(
+          yield* db.all(sql`
+          SELECT id, parent_id, workspace_id, directory, time_created, time_updated FROM session_v2 ORDER BY id
+        `),
+        ).toEqual(metadata)
+        expect(yield* db.all(sql`SELECT * FROM session ORDER BY id`)).toEqual(legacy)
+        expect(yield* db.all(sql`SELECT * FROM message ORDER BY id`)).toEqual(legacyMessages)
+        expect(yield* db.all(sql`SELECT * FROM part ORDER BY id`)).toEqual(legacyParts)
+        expect(yield* db.all(sql`SELECT * FROM session_message ORDER BY id`)).toEqual(messages)
         expect(yield* db.get(sql`SELECT value FROM kv WHERE key = 'migration.v1-v2.global-sessions'`)).toEqual({
           value: '{"phase":"completed"}',
         })
+        const repaired = yield* db.all(sql`SELECT * FROM session_v2 ORDER BY id`)
+        expect(yield* V1Migration.run()).toEqual({ status: "completed" })
+        expect(yield* db.all(sql`SELECT * FROM session_v2 ORDER BY id`)).toEqual(repaired)
+        expect(yield* db.all(sql`SELECT * FROM session_message ORDER BY id`)).toEqual(messages)
       }),
+    )
+  })
+
+  test.each([1, 2])("retries unfinished V1 global repairs after lookup timeout %i", async (timeoutAt) => {
+    await using tmp = await tmpdir()
+    const directories = ["a", "b", "c"].map((name) => path.join(tmp.path, name))
+    await Promise.all(directories.map((directory) => fs.mkdir(directory)))
+    await database(
+      Effect.gen(function* () {
+        const database = yield* Database.Service
+        const db = database.db
+        const projects = yield* Project.Service
+        yield* db.run(sql`
+          INSERT INTO project (id, worktree, time_created, time_updated, sandboxes)
+          VALUES ('global', '/', 1, 2, '[]')
+        `)
+        yield* db.run(sql`
+          INSERT INTO kv (key, value, time_created, time_updated)
+          VALUES ('migration.v1-v2', '{"phase":"completed"}', 1, 1)
+        `)
+        yield* Effect.forEach(directories, (directory, index) =>
+          Effect.forEach(["root", "child"], (kind) =>
+            Effect.gen(function* () {
+              const id = `ses_${index}_${kind}`
+              const parent = kind === "child" ? `ses_${index}_root` : null
+              yield* db.run(sql`
+                INSERT INTO session (id, project_id, parent_id, slug, directory, title, version, time_created, time_updated)
+                VALUES (${id}, 'global', ${parent}, ${id}, ${directory}, 'Test', '1', 10, 20)
+              `)
+              yield* db.run(sql`
+                INSERT INTO session_v2 (id, project_id, parent_id, slug, directory, title, version, time_created, time_updated)
+                VALUES (${id}, 'global', ${parent}, ${id}, ${directory}, 'Test', '1', 10, 20)
+              `)
+              yield* db.run(sql`
+                INSERT INTO message (id, session_id, time_created, time_updated, data)
+                VALUES (${`msg_${id}`}, ${id}, 11, 12, '{"role":"user","text":"keep legacy history"}')
+              `)
+              yield* db.run(sql`
+                INSERT INTO session_message (id, session_id, type, seq, time_created, time_updated, data)
+                VALUES (${`msg_${id}`}, ${id}, 'user', 0, 11, 12, '{"text":"keep projected history"}')
+              `)
+            }),
+          ),
+        )
+        const legacy = yield* db.all(sql`SELECT * FROM session ORDER BY id`)
+        const legacyMessages = yield* db.all(sql`SELECT * FROM message ORDER BY id`)
+        const messages = yield* db.all(sql`SELECT * FROM session_message ORDER BY id`)
+        const metadata = yield* db.all(sql`
+          SELECT id, parent_id, directory, time_created, time_updated FROM session_v2 ORDER BY id
+        `)
+        const stalled = yield* Deferred.make<void>()
+        const attempted: string[] = []
+        const fiber = yield* V1Migration.run().pipe(
+          Effect.provideService(Project.Service, {
+            ...projects,
+            resolve: (directory, options) =>
+              Effect.gen(function* () {
+                attempted.push(directory)
+                if (attempted.length === timeoutAt) {
+                  yield* Deferred.succeed(stalled, undefined)
+                  return yield* Effect.never
+                }
+                return yield* projects.resolve(directory, options)
+              }),
+          }),
+          Effect.forkChild({ startImmediately: true }),
+        )
+        yield* Deferred.await(stalled)
+        yield* Effect.yieldNow
+        yield* TestClock.adjust("6 seconds")
+        expect(yield* Fiber.join(fiber)).toEqual({ status: "completed" })
+        expect(yield* db.get(sql`SELECT value FROM kv WHERE key = 'migration.v1-v2.global-sessions'`)).toBeUndefined()
+        const committed = yield* db.all<{ id: string; project_id: string; path: string }>(sql`
+          SELECT id, project_id, path FROM session_v2 WHERE project_id != 'global' ORDER BY id
+        `)
+        expect(committed).toHaveLength((timeoutAt - 1) * 2)
+        expect(yield* db.all(sql`SELECT * FROM session ORDER BY id`)).toEqual(legacy)
+        expect(yield* db.all(sql`SELECT * FROM message ORDER BY id`)).toEqual(legacyMessages)
+        expect(yield* db.all(sql`SELECT * FROM session_message ORDER BY id`)).toEqual(messages)
+
+        const retried: string[] = []
+        expect(
+          yield* V1Migration.run().pipe(
+            Effect.provideService(Project.Service, {
+              ...projects,
+              resolve: (directory, options) => {
+                retried.push(directory)
+                return projects.resolve(directory, options)
+              },
+            }),
+          ),
+        ).toEqual({ status: "completed" })
+        expect(retried.toSorted()).toEqual(
+          directories.filter((directory) => !attempted.slice(0, -1).includes(directory)),
+        )
+        expect(
+          yield* db.all(sql`SELECT id, project_id, path FROM session_v2 WHERE project_id != 'global' ORDER BY id`),
+        ).toEqual(expect.arrayContaining(committed))
+        yield* Effect.forEach(directories, (directory, index) =>
+          Effect.gen(function* () {
+            const owner = yield* projects.resolve(AbsolutePath.make(directory), { persist: false })
+            expect(
+              yield* db.all(sql`
+              SELECT project_id, path FROM session_v2 WHERE id IN (${`ses_${index}_root`}, ${`ses_${index}_child`})
+            `),
+            ).toEqual([
+              { project_id: owner.id, path: "" },
+              { project_id: owner.id, path: "" },
+            ])
+          }),
+        )
+        expect(
+          yield* db.all(sql`
+          SELECT id, parent_id, directory, time_created, time_updated FROM session_v2 ORDER BY id
+        `),
+        ).toEqual(metadata)
+        expect(yield* db.all(sql`SELECT * FROM session ORDER BY id`)).toEqual(legacy)
+        expect(yield* db.all(sql`SELECT * FROM message ORDER BY id`)).toEqual(legacyMessages)
+        expect(yield* db.all(sql`SELECT * FROM session_message ORDER BY id`)).toEqual(messages)
+        expect(yield* db.get(sql`SELECT value FROM kv WHERE key = 'migration.v1-v2.global-sessions'`)).toEqual({
+          value: '{"phase":"completed"}',
+        })
+      }).pipe(Effect.provide(TestClock.layer())),
     )
   })
 
