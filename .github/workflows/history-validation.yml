@@ -19,24 +19,39 @@ jobs:
           persist-credentials: false
       - name: Setup pinned toolchain and dependencies
         uses: ./.github/actions/setup-bun
+      - name: Provision verified ripgrep before offline tests
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/rg-bin"
+          curl --fail --location --silent --show-error \
+            https://github.com/BurntSushi/ripgrep/releases/download/15.1.0/ripgrep-15.1.0-x86_64-unknown-linux-musl.tar.gz \
+            --output "$RUNNER_TEMP/rg.tar.gz"
+          printf '1c9297be4a084eea7ecaedf93eb03d058d6faae29bbc57ecdaf5063921491599  %s\n' "$RUNNER_TEMP/rg.tar.gz" | sha256sum --check --strict
+          tar -xzf "$RUNNER_TEMP/rg.tar.gz" -C "$RUNNER_TEMP/rg-bin" --strip-components=1 \
+            ripgrep-15.1.0-x86_64-unknown-linux-musl/rg
+          "$RUNNER_TEMP/rg-bin/rg" --version
+          echo "$RUNNER_TEMP/rg-bin" >> "$GITHUB_PATH"
       - name: Core tests
         working-directory: packages/core
-        run: bun run script/test.ts
+        run: GITHUB_ACTIONS=false bun run script/test.ts
       - name: CLI tests in an isolated profile
+        if: ${{ !cancelled() }}
         working-directory: packages/cli
         shell: bash
         run: |
           root="$(mktemp -d)"
           mkdir -p "$root/home"
-          HOME="$root/home" OPENCODE_TEST_HOME="$root/home" \
+          GITHUB_ACTIONS=false HOME="$root/home" OPENCODE_TEST_HOME="$root/home" \
             XDG_CONFIG_HOME="$root/config" XDG_DATA_HOME="$root/data" \
             XDG_CACHE_HOME="$root/cache" XDG_STATE_HOME="$root/state" \
             OPENCODE_CONFIG_DIR="$root/config/opencode" \
             OPENCODE_CONFIG_CONTENT='{}' OPENCODE_DISABLE_MODELS_FETCH=true \
             bun test --timeout 30000 --only-failures
       - name: Canonical lint and typecheck
+        if: ${{ !cancelled() }}
         run: bun run check
       - name: Official compiler checks for changed packages
+        if: ${{ !cancelled() }}
         run: |
           bun run --cwd packages/core typecheck:tsc
           bun run --cwd packages/cli typecheck:tsc
