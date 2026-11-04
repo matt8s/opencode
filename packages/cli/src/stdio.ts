@@ -3,8 +3,7 @@
 export function writeStdout(text: string) {
   return new Promise<void>((resolve, reject) => {
     process.stdout.write(text, (error) => {
-      // The reader closed the pipe early, e.g. `opencode api get ... | head`.
-      if (error && (error as NodeJS.ErrnoException).code !== "EPIPE") return reject(error)
+      if (error) return reject(error)
       resolve()
     })
   })
