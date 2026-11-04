@@ -52,7 +52,7 @@ describe.skipIf(process.platform === "win32")("writeStdout", () => {
     })
     try {
       await child.stdout.cancel()
-      child.stdin.end("consumer closed")
+      child.stdin.end()
       const [stderr, exit] = await Promise.all([new Response(child.stderr).text(), child.exited])
       expect(stderr).toBe("EPIPE")
       expect(exit).toBe(1)
