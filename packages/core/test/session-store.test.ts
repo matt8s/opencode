@@ -1,20 +1,21 @@
 import { describe, expect } from "bun:test"
 import { asc, eq } from "drizzle-orm"
-import { Effect } from "effect"
+import { DateTime, Effect } from "effect"
 import { Bus } from "@opencode/core/bus"
 import { Database } from "@opencode/core/database/database"
 import { AppNodeBuilder } from "@opencode/core/effect/app-node-builder"
 import { ProjectTable } from "@opencode/core/project/sql"
 import { SessionHistory } from "@opencode/core/session/history"
 import { SessionProjector } from "@opencode/core/session/projector"
-import { SessionMessageTable, SessionPartTable } from "@opencode/core/session/sql"
+import { SessionMessageTable, SessionPartTable, SessionTable } from "@opencode/core/session/sql"
 import { SessionStore } from "@opencode/core/session/store"
 import { Agent } from "@opencode/schema/agent"
 import { Event } from "@opencode/schema/event"
 import { Model } from "@opencode/schema/model"
 import { Project } from "@opencode/schema/project"
 import { Provider } from "@opencode/schema/provider"
-import { AbsolutePath } from "@opencode/schema/schema"
+import { AbsolutePath, RelativePath } from "@opencode/schema/schema"
+import { Workspace } from "@opencode/schema/workspace"
 import { Session } from "@opencode/schema/session"
 import { SessionEvent } from "@opencode/schema/session-event"
 import { SessionMessage } from "@opencode/schema/session-message"
@@ -329,6 +330,150 @@ describe("SessionStore", () => {
         .orderBy(asc(SessionMessageTable.seq))
         .all()
       expect(yield* SessionHistory.decodeMessageRows(database.db, rows)).toEqual(hydrated)
+    }),
+  )
+  it.effect("lists sessions from every project row that shares the same worktree", () =>
+    Effect.gen(function* () {
+      const database = (yield* Database.Service).db
+      const bus = yield* Bus.Service
+      const worktree = AbsolutePath.make("/shared")
+      const elsewhere = AbsolutePath.make("/elsewhere")
+      yield* database
+        .insert(ProjectTable)
+        .values([
+          { id: Project.ID.make("proj_old"), worktree, sandboxes: [] },
+          { id: Project.ID.make("proj_new"), worktree, sandboxes: [] },
+          { id: Project.ID.make("proj_other"), worktree: elsewhere, sandboxes: [] },
+        ])
+        .run()
+      yield* Effect.forEach(
+        [
+          { id: "ses_old", projectID: Project.ID.make("proj_old"), directory: worktree },
+          { id: "ses_new", projectID: Project.ID.make("proj_new"), directory: worktree },
+          { id: "ses_other", projectID: Project.ID.make("proj_other"), directory: elsewhere },
+        ],
+        (row) =>
+          bus.publish(SessionEvent.Created, {
+            sessionID: Session.ID.make(row.id),
+            projectID: row.projectID,
+            location: { directory: row.directory },
+            slug: "store-test",
+            version: "test",
+          }),
+      )
+      const store = yield* SessionStore.Service
+      const listed = (yield* store.list({ project: Project.ID.make("proj_new") })).map((session) => String(session.id))
+      expect(listed.toSorted()).toEqual(["ses_new", "ses_old"])
+    }),
+  )
+  it.effect("does not list sessions of the global project row that shares the worktree", () =>
+    Effect.gen(function* () {
+      const database = (yield* Database.Service).db
+      const bus = yield* Bus.Service
+      const folder = AbsolutePath.make("/committed")
+      const commitless = AbsolutePath.make("/commitless")
+      yield* database
+        .insert(ProjectTable)
+        .values([
+          { id: Project.ID.global, worktree: folder, sandboxes: [] },
+          { id: Project.ID.make("proj_committed"), worktree: folder, sandboxes: [] },
+        ])
+        .run()
+      yield* Effect.forEach(
+        [
+          { id: "ses_commitless", projectID: Project.ID.global, directory: commitless },
+          { id: "ses_committed", projectID: Project.ID.make("proj_committed"), directory: folder },
+        ],
+        (row) =>
+          bus.publish(SessionEvent.Created, {
+            sessionID: Session.ID.make(row.id),
+            projectID: row.projectID,
+            location: { directory: row.directory },
+            slug: "store-test",
+            version: "test",
+          }),
+      )
+      const store = yield* SessionStore.Service
+      const listed = (yield* store.list({ project: Project.ID.make("proj_committed") })).map((session) =>
+        String(session.id),
+      )
+      expect(listed).toEqual(["ses_committed"])
+      expect((yield* store.list({ project: Project.ID.global })).map((session) => String(session.id))).toEqual([
+        "ses_commitless",
+      ])
+    }),
+  )
+  it.effect("preserves filters and pagination across shared-worktree identities", () =>
+    Effect.gen(function* () {
+      const database = (yield* Database.Service).db
+      const store = yield* SessionStore.Service
+      const old = Project.ID.make("proj_filter_old")
+      const current = Project.ID.make("proj_filter_current")
+      const worktree = AbsolutePath.make("/shared-filter")
+      const workspace = Workspace.ID.make("wrk_filter")
+      yield* database
+        .insert(ProjectTable)
+        .values([
+          { id: old, worktree, sandboxes: [] },
+          { id: current, worktree, sandboxes: [] },
+        ])
+        .run()
+      const rows = [
+        { id: "ses_filter_old", project_id: old, time_updated: 10 },
+        { id: "ses_filter_current", project_id: current, time_updated: 20 },
+        { id: "ses_filter_child", project_id: old, time_updated: 30, parent_id: Session.ID.make("ses_filter_old") },
+        { id: "ses_filter_archived", project_id: old, time_updated: 40, time_archived: 40 },
+        {
+          id: "ses_filter_other_workspace",
+          project_id: current,
+          time_updated: 50,
+          workspace_id: Workspace.ID.make("wrk_other"),
+        },
+        { id: "ses_filter_other_path", project_id: old, time_updated: 60, path: RelativePath.make("other") },
+        { id: "ses_filter_other_title", project_id: current, time_updated: 70, title: "excluded" },
+      ]
+      yield* database
+        .insert(SessionTable)
+        .values(
+          rows.map((row) => ({
+            directory: worktree,
+            slug: "filter-test",
+            version: "test",
+            workspace_id: workspace,
+            path: RelativePath.make("sub"),
+            title: "matching title",
+            ...row,
+            id: Session.ID.make(row.id),
+          })),
+        )
+        .run()
+      const input = {
+        project: current,
+        workspaceID: workspace,
+        subpath: RelativePath.make("sub"),
+        search: "matching",
+        parentID: null,
+        archived: false,
+      }
+      const first = yield* store.list({ ...input, limit: 1 })
+      expect(first.map((session) => String(session.id))).toEqual(["ses_filter_current"])
+      const anchor = first[0]
+      if (!anchor) throw new Error("Expected a first page")
+      const second = yield* store.list({
+        ...input,
+        limit: 1,
+        anchor: { id: anchor.id, time: DateTime.toEpochMillis(anchor.time.updated), direction: "next" },
+      })
+      expect(second.map((session) => String(session.id))).toEqual(["ses_filter_old"])
+      expect(
+        (yield* store.list({ ...input, parentID: Session.ID.make("ses_filter_old") })).map((session) =>
+          String(session.id),
+        ),
+      ).toEqual(["ses_filter_child"])
+      expect((yield* store.list({ ...input, archived: true })).map((session) => String(session.id))).toEqual([
+        "ses_filter_archived",
+      ])
+      expect(yield* store.list({ directory: AbsolutePath.make("/shared-filter/sub"), parentID: null })).toEqual([])
     }),
   )
 })

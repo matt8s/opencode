@@ -1,0 +1,42 @@
+name: Recovery candidate validation
+
+on:
+  push:
+    branches: [history-validation]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Checkout candidate
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          persist-credentials: false
+      - name: Setup pinned toolchain and dependencies
+        uses: ./.github/actions/setup-bun
+      - name: Core tests
+        working-directory: packages/core
+        run: bun run script/test.ts
+      - name: CLI tests in an isolated profile
+        working-directory: packages/cli
+        shell: bash
+        run: |
+          root="$(mktemp -d)"
+          mkdir -p "$root/home"
+          HOME="$root/home" OPENCODE_TEST_HOME="$root/home" \
+            XDG_CONFIG_HOME="$root/config" XDG_DATA_HOME="$root/data" \
+            XDG_CACHE_HOME="$root/cache" XDG_STATE_HOME="$root/state" \
+            OPENCODE_CONFIG_DIR="$root/config/opencode" \
+            OPENCODE_CONFIG_CONTENT='{}' OPENCODE_DISABLE_MODELS_FETCH=true \
+            bun test --timeout 30000 --only-failures
+      - name: Canonical lint and typecheck
+        run: bun run check
+      - name: Official compiler checks for changed packages
+        run: |
+          bun run --cwd packages/core typecheck:tsc
+          bun run --cwd packages/cli typecheck:tsc
