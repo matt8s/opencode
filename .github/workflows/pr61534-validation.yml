@@ -1,0 +1,48 @@
+name: PR 61534 current-base validation
+on:
+  push:
+    branches: [pr61534-validation]
+permissions:
+  contents: read
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          repository: anomalyco/opencode
+          ref: ae0fde771d8eb499b7e030eccd08a96b2533c6f0
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Merge exact PR head into pinned upstream
+        run: |
+          git fetch https://github.com/matt8s/opencode.git d3f7c9a03ef437bd9aba1c0088d782f1c9291f6a
+          git -c user.name='Validation' -c user.email='validation@users.noreply.github.com' merge --no-edit FETCH_HEAD
+          git log -1 --format='%H %P'
+          git diff --stat ae0fde771d8eb499b7e030eccd08a96b2533c6f0 HEAD
+      - uses: ./.github/actions/setup-bun
+      - name: Provision ripgrep for offline tests
+        run: |
+          mkdir -p "$RUNNER_TEMP/rg-bin"
+          curl -fsSL https://github.com/BurntSushi/ripgrep/releases/download/15.1.0/ripgrep-15.1.0-x86_64-unknown-linux-musl.tar.gz -o "$RUNNER_TEMP/rg.tar.gz"
+          printf '1c9297be4a084eea7ecaedf93eb03d058d6faae29bbc57ecdaf5063921491599  %s\n' "$RUNNER_TEMP/rg.tar.gz" | sha256sum --check --strict
+          tar -xzf "$RUNNER_TEMP/rg.tar.gz" -C "$RUNNER_TEMP/rg-bin" --strip-components=1 ripgrep-15.1.0-x86_64-unknown-linux-musl/rg
+          echo "$RUNNER_TEMP/rg-bin" >> "$GITHUB_PATH"
+      - name: Config suite with ancestor configuration
+        working-directory: packages/core
+        run: |
+          root=$(mktemp -d)
+          mkdir -p "$root/.claude" "$root/.agents" "$root/tmp"
+          TMPDIR="$root/tmp" GITHUB_ACTIONS=false bun run script/test.ts test/config/config.test.ts
+      - name: Full Core suite
+        if: ${{ !cancelled() }}
+        working-directory: packages/core
+        run: GITHUB_ACTIONS=false bun run script/test.ts
+      - name: Core official compiler
+        if: ${{ !cancelled() }}
+        working-directory: packages/core
+        run: bun run typecheck:tsc
+      - name: Canonical checks
+        if: ${{ !cancelled() }}
+        run: bun run check
