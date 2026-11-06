@@ -15,7 +15,7 @@ import { AppNodeBuilder } from "@opencode/core/effect/app-node-builder"
 import { LayerNode } from "@opencode/util/effect/layer-node"
 import { FSUtil } from "@opencode/util/fs-util"
 import { Global } from "@opencode/util/global"
-import { Deferred, Effect, Fiber, Layer, Logger, Schedule, Schema, Scope } from "effect"
+import { Deferred, Effect, Fiber, Layer, Logger, PlatformError, Schedule, Schema, Scope } from "effect"
 import { TestClock } from "effect/testing"
 import { eq, sql } from "drizzle-orm"
 import type { SqlClient } from "effect/sql/SqlClient"
@@ -25,6 +25,14 @@ import fs from "fs/promises"
 import path from "path"
 
 const makeDb = EffectDrizzleSqlite.makeWithDefaults()
+const caseInsensitive = await (async () => {
+  await using tmp = await tmpdir()
+  await fs.mkdir(path.join(tmp.path, "Case"))
+  return fs.realpath(path.join(tmp.path, "case")).then(
+    () => true,
+    () => false,
+  )
+})()
 const run = <A, E>(effect: Effect.Effect<A, E, SqlClient | Scope.Scope | Global.Service>) =>
   Effect.runPromise(
     Effect.scoped(
@@ -1257,7 +1265,11 @@ describe("V1Migration database workflow", () => {
     )
   })
 
-  test("repairs V1 global sessions left by a completed import", async () => {
+  test.each([
+    "symlink",
+    // Probe the fixture filesystem rather than assuming an OS implies case folding.
+    ...(caseInsensitive ? ["case"] : []),
+  ])("repairs completed imports with %s aliases", async (alias) => {
     await using tmp = await tmpdir()
     const plain = path.join(tmp.path, "plain")
     const repo = path.join(tmp.path, "repo")
@@ -1265,6 +1277,9 @@ describe("V1Migration database workflow", () => {
     await fs.mkdir(plain, { recursive: true })
     await fs.mkdir(path.join(repo, "pkg", "a"), { recursive: true })
     await initRepo(repo)
+    const linked = path.join(tmp.path, alias === "case" ? "PLAIN" : "plain-link")
+    if (alias === "symlink") await fs.symlink(plain, linked, process.platform === "win32" ? "junction" : undefined)
+    expect(await fs.realpath(linked)).toBe(await fs.realpath(plain))
     await database(
       Effect.gen(function* () {
         const { db } = yield* Database.Service
@@ -1277,6 +1292,7 @@ describe("V1Migration database workflow", () => {
         )
         const sessions = [
           { id: "ses_plain", directory: plain, v1: true },
+          { id: "ses_linked", directory: linked, v1: true },
           { id: "ses_child", directory: plain, v1: true },
           { id: "ses_repo", directory: path.join(repo, "pkg", "a"), v1: true },
           { id: "ses_missing", directory: missing, v1: true },
@@ -1322,6 +1338,9 @@ describe("V1Migration database workflow", () => {
           INSERT INTO workspace (id, provider, created_at, last_used_at) VALUES ('wrk_explicit', 'local', 1, 2)
         `)
         yield* db.run(sql`UPDATE session_v2 SET workspace_id = 'wrk_explicit' WHERE id = 'ses_workspace'`)
+        // Retain NULL coverage on the child while exercising stale V1 paths on both owner shapes.
+        yield* db.run(sql`UPDATE session_v2 SET path = 'legacy/plain' WHERE id IN ('ses_plain', 'ses_linked')`)
+        yield* db.run(sql`UPDATE session_v2 SET path = 'legacy/repo' WHERE id = 'ses_repo'`)
         const legacy = yield* db.all(sql`SELECT * FROM session ORDER BY id`)
         const legacyMessages = yield* db.all(sql`SELECT * FROM message ORDER BY id`)
         const legacyParts = yield* db.all(sql`SELECT * FROM part ORDER BY id`)
@@ -1337,6 +1356,7 @@ describe("V1Migration database workflow", () => {
         }
         expect(yield* db.all(sql`SELECT id, project_id, path, time_updated FROM session_v2 ORDER BY id`)).toEqual([
           { id: "ses_child", project_id: owners.plain.id, path: "", time_updated: 2 },
+          { id: "ses_linked", project_id: owners.plain.id, path: "", time_updated: 2 },
           { id: "ses_missing", project_id: "global", path: null, time_updated: 2 },
           { id: "ses_native", project_id: "global", path: null, time_updated: 2 },
           { id: "ses_owned", project_id: "owned", path: "kept", time_updated: 2 },
@@ -1353,27 +1373,41 @@ describe("V1Migration database workflow", () => {
         expect(yield* db.all(sql`SELECT * FROM message ORDER BY id`)).toEqual(legacyMessages)
         expect(yield* db.all(sql`SELECT * FROM part ORDER BY id`)).toEqual(legacyParts)
         expect(yield* db.all(sql`SELECT * FROM session_message ORDER BY id`)).toEqual(messages)
-        expect(yield* db.get(sql`SELECT value FROM kv WHERE key = 'migration.v1-v2.global-sessions'`)).toEqual({
-          value: '{"phase":"completed"}',
-        })
+        expect(yield* db.get(sql`SELECT value FROM kv WHERE key = 'migration.v1-v2.global-sessions'`)).toBeUndefined()
         const repaired = yield* db.all(sql`SELECT * FROM session_v2 ORDER BY id`)
         expect(yield* V1Migration.run()).toEqual({ status: "completed" })
         expect(yield* db.all(sql`SELECT * FROM session_v2 ORDER BY id`)).toEqual(repaired)
         expect(yield* db.all(sql`SELECT * FROM session_message ORDER BY id`)).toEqual(messages)
+        yield* Effect.promise(() => fs.mkdir(missing))
+        expect(yield* V1Migration.run()).toEqual({ status: "completed" })
+        const owner = yield* projects.resolve(AbsolutePath.make(missing))
+        expect(
+          yield* db.get(sql`SELECT project_id, path, time_updated FROM session_v2 WHERE id = 'ses_missing'`),
+        ).toEqual({
+          project_id: owner.id,
+          path: "",
+          time_updated: 2,
+        })
+        expect(yield* db.get(sql`SELECT value FROM kv WHERE key = 'migration.v1-v2.global-sessions'`)).toEqual({
+          value: '{"phase":"completed"}',
+        })
       }),
     )
   })
 
   test.each([
-    { phase: "completed", timeoutAt: 1, lookups: 1, owned: 0 },
-    { phase: "completed", timeoutAt: 2, lookups: 2, owned: 2 },
-    { phase: "fresh", timeoutAt: 0, lookups: 3, owned: 6 },
-    { phase: "fresh", timeoutAt: 1, lookups: 1, owned: 0 },
-    { phase: "fresh", timeoutAt: 2, lookups: 2, owned: 2 },
-    { phase: "resumed", timeoutAt: 0, lookups: 2, owned: 4 },
-    { phase: "resumed", timeoutAt: 1, lookups: 1, owned: 0 },
-    { phase: "resumed", timeoutAt: 2, lookups: 2, owned: 2 },
-  ])("retries unfinished V1 global repairs after $phase import (timeout $timeoutAt)", async (input) => {
+    { phase: "completed", timeoutAt: 1, lookups: 1, owned: 0, failure: "none" },
+    { phase: "completed", timeoutAt: 2, lookups: 2, owned: 2, failure: "none" },
+    { phase: "fresh", timeoutAt: 0, lookups: 3, owned: 6, failure: "none" },
+    { phase: "fresh", timeoutAt: 1, lookups: 1, owned: 0, failure: "none" },
+    { phase: "fresh", timeoutAt: 2, lookups: 2, owned: 2, failure: "none" },
+    { phase: "resumed", timeoutAt: 0, lookups: 2, owned: 4, failure: "none" },
+    { phase: "resumed", timeoutAt: 1, lookups: 1, owned: 0, failure: "none" },
+    { phase: "resumed", timeoutAt: 2, lookups: 2, owned: 2, failure: "none" },
+    { phase: "completed", timeoutAt: 0, lookups: 2, owned: 4, failure: "realpath" },
+    { phase: "completed", timeoutAt: 0, lookups: 2, owned: 4, failure: "isDir" },
+    { phase: "completed", timeoutAt: 0, lookups: 3, owned: 4, failure: "project" },
+  ])("retries V1 repair: $phase, timeout $timeoutAt, failure $failure", async (input) => {
     await using tmp = await tmpdir()
     const directories = ["a", "b", "c"].map((name) => path.join(tmp.path, name))
     await Promise.all(directories.map((directory) => fs.mkdir(directory)))
@@ -1382,6 +1416,7 @@ describe("V1Migration database workflow", () => {
         const database = yield* Database.Service
         const db = database.db
         const projects = yield* Project.Service
+        const filesystem = yield* FSUtil.Service
         yield* db.run(sql`
           INSERT INTO project (id, worktree, time_created, time_updated, sandboxes)
           VALUES ('global', '/', 1, 2, '[]')
@@ -1444,11 +1479,31 @@ describe("V1Migration database workflow", () => {
         const stalled = yield* Deferred.make<void>()
         const attempted: string[] = []
         const fiber = yield* V1Migration.run().pipe(
+          Effect.provideService(FSUtil.Service, {
+            ...filesystem,
+            realPath: (directory) =>
+              input.failure === "realpath" && directory === directories[1]
+                ? Effect.fail(
+                    PlatformError.systemError({
+                      _tag: "PermissionDenied",
+                      module: "FileSystem",
+                      method: "realPath",
+                      pathOrDescriptor: directory,
+                    }),
+                  )
+                : filesystem.realPath(directory),
+            isDir: (directory) =>
+              input.failure === "isDir" && directory === directories[1]
+                ? Effect.succeed(false)
+                : filesystem.isDir(directory),
+          }),
           Effect.provideService(Project.Service, {
             ...projects,
             resolve: (directory, options) =>
               Effect.gen(function* () {
                 attempted.push(directory)
+                if (input.failure === "project" && directory === directories[1])
+                  return yield* Effect.die(new Error("Project lookup unavailable"))
                 if (attempted.length === input.timeoutAt) {
                   yield* Deferred.succeed(stalled, undefined)
                   return yield* Effect.never

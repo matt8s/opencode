@@ -783,6 +783,7 @@ function repairGlobalSessions(db: Database.Interface["db"]) {
         AND EXISTS (SELECT 1 FROM session WHERE session.id = session_v2.id)
       GROUP BY directory
     `)
+    let unresolved = false
     for (const [index, folder] of folders.entries()) {
       updateProgress({ label: "Repairing V1 sessions", numerator: index, denominator: folders.length })
       const resolved = yield* resolveDirectory(folder.directory)
@@ -794,7 +795,11 @@ function repairGlobalSessions(db: Database.Interface["db"]) {
         return
       }
       const owner = resolved.value
-      if (!owner || owner.project.id === Project.ID.global) continue
+      if (!owner) {
+        unresolved = true
+        continue
+      }
+      if (owner.project.id === Project.ID.global) continue
       yield* db
         .transaction((tx) =>
           Effect.gen(function* () {
@@ -819,6 +824,9 @@ function repairGlobalSessions(db: Database.Interface["db"]) {
         )
         .pipe(Effect.orDie)
     }
+    // Missing folders and transient lookup failures both remain eligible on the next startup.
+    // Repaired non-global folders have already committed and will not be selected again.
+    if (unresolved) return
     yield* db
       .insert(KVTable)
       .values({ key: REPAIR_STATE_KEY, value: { phase: "completed" } })
