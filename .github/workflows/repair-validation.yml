@@ -1,0 +1,51 @@
+name: Migration repair validation
+on:
+  push:
+    branches: [repair-validation]
+permissions:
+  contents: read
+jobs:
+  validate:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-2025, macos-15]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+      - name: Record source revision
+        run: git log -2 --format='%H %P'
+      - uses: ./.github/actions/setup-bun
+      - name: Provision ripgrep for Linux offline suite
+        if: runner.os == 'Linux'
+        run: |
+          mkdir -p "$RUNNER_TEMP/rg-bin"
+          curl -fsSL https://github.com/BurntSushi/ripgrep/releases/download/15.1.0/ripgrep-15.1.0-x86_64-unknown-linux-musl.tar.gz -o "$RUNNER_TEMP/rg.tar.gz"
+          printf '1c9297be4a084eea7ecaedf93eb03d058d6faae29bbc57ecdaf5063921491599  %s\n' "$RUNNER_TEMP/rg.tar.gz" | sha256sum --check --strict
+          tar -xzf "$RUNNER_TEMP/rg.tar.gz" -C "$RUNNER_TEMP/rg-bin" --strip-components=1 ripgrep-15.1.0-x86_64-unknown-linux-musl/rg
+          echo "$RUNNER_TEMP/rg-bin" >> "$GITHUB_PATH"
+      - name: Repeated migration regression tests
+        working-directory: packages/core
+        run: GITHUB_ACTIONS=false bun run script/test.ts test/v1-migration.test.ts --rerun-each 10
+      - name: Core official compiler
+        if: ${{ !cancelled() }}
+        working-directory: packages/core
+        run: bun run typecheck:tsc
+      - name: Full Core suite
+        if: ${{ !cancelled() && runner.os == 'Linux' }}
+        working-directory: packages/core
+        run: GITHUB_ACTIONS=false bun run script/test.ts
+      - name: Canonical checks
+        if: ${{ !cancelled() && runner.os == 'Linux' }}
+        run: bun run check
+      - name: Core package build
+        if: ${{ !cancelled() && runner.os == 'Linux' }}
+        working-directory: packages/core
+        run: bun run build
