@@ -57,6 +57,13 @@ export const clientSettings: Entry<SettingsRootTab>[] = [
   },
   {
     tab: "general",
+    label: "settings.general.row.spellcheck.title",
+    target: "settings-spellcheck",
+    keywords: "spelling spell check dictionary",
+    available: "desktop",
+  },
+  {
+    tab: "general",
     label: "settings.general.row.mobileTitlebarBottom.title",
     target: "settings-mobile-titlebar-bottom",
     available: "mobile",
@@ -117,6 +124,13 @@ export const clientSettings: Entry<SettingsRootTab>[] = [
     target: "settings-new-question-ui",
     description: "settings.experimental.row.newQuestionUI.description",
     keywords: "question answers keyboard dock redesign",
+  },
+  {
+    tab: "experimental",
+    label: "settings.experimental.row.sidebarOrganize.title",
+    target: "settings-sidebar-organize",
+    description: "settings.experimental.row.sidebarOrganize.description",
+    keywords: "vertical side tabs projects recents organize sidebar",
   },
   {
     tab: "appearance",
